@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -95,6 +96,27 @@ func (ti tupleID) reply() tupleID {
 	}
 }
 
+type manipType int
+
+const (
+	// manipNotPerformed indicates that NAT has not been performed.
+	manipNotPerformed manipType = iota
+
+	// manipPerformed indicates that NAT was performed.
+	manipPerformed
+
+	// manipPerformedNoop indicates that NAT was performed but it was a no-op.
+	manipPerformedNoop
+)
+
+type finalizeResult uint32
+
+const (
+	_ finalizeResult = iota
+	finalizeResultSuccess
+	finalizeResultConflict
+)
+
 // conn is a tracked connection.
 //
 // +stateify savable
@@ -107,19 +129,21 @@ type conn struct {
 	// reply is the tuple in reply direction.
 	reply tuple
 
+	finalizeOnce sync.Once
+	// Holds a finalizeResult.
+	//
+	// +checkatomics
+	finalizeResult uint32
+
 	mu sync.RWMutex `state:"nosave"`
-	// Indicates that the connection has been finalized and may handle replies.
+	// sourceManip indicates the source manipulation type.
 	//
 	// +checklocks:mu
-	finalized bool
-	// sourceManip indicates the packet's source is manipulated.
+	sourceManip manipType
+	// destinationManip indicates the destination's manipulation type.
 	//
 	// +checklocks:mu
-	sourceManip bool
-	// destinationManip indicates the packet's destination is manipulated.
-	//
-	// +checklocks:mu
-	destinationManip bool
+	destinationManip manipType
 
 	stateMu sync.RWMutex `state:"nosave"`
 	// tcb is TCB control block. It is used to keep track of states
@@ -492,60 +516,86 @@ func (bkt *bucket) connForTIDRLocked(tid tupleID, now tcpip.MonotonicTime) *tupl
 	return nil
 }
 
-func (ct *ConnTrack) finalize(cn *conn) {
-	tid := cn.reply.id()
-	id := ct.bucket(tid)
-
+func (ct *ConnTrack) finalize(cn *conn) bool {
 	ct.mu.RLock()
-	bkt := &ct.buckets[id]
+	buckets := ct.buckets
 	ct.mu.RUnlock()
 
+	{
+		tid := cn.reply.id()
+		id := ct.bucket(tid)
+
+		bkt := &buckets[id]
+		bkt.mu.Lock()
+		if bkt.connForTIDRLocked(tid, ct.clock.NowMonotonic()) == nil {
+			bkt.tuples.PushFront(&cn.reply)
+			bkt.mu.Unlock()
+			return true
+		}
+		bkt.mu.Unlock()
+	}
+
+	// Another connection for the reply already exists. Remove the original and
+	// let the caller know we failed.
+	//
+	// TODO(https://gvisor.dev/issue/6850): Investigate handling this clash
+	// better.
+
+	tid := cn.original.id()
+	id := ct.bucket(tid)
+	bkt := &buckets[id]
 	bkt.mu.Lock()
 	defer bkt.mu.Unlock()
-
-	if t := bkt.connForTIDRLocked(tid, ct.clock.NowMonotonic()); t != nil {
-		// Another connection for the reply already exists. We can't do much about
-		// this so we leave the connection cn represents in a state where it can
-		// send packets but its responses will be mapped to some other connection.
-		// This may be okay if the connection only expects to send packets without
-		// any responses.
-		//
-		// TODO(https://gvisor.dev/issue/6850): Investigate handling this clash
-		// better.
-		return
-	}
-
-	bkt.tuples.PushFront(&cn.reply)
+	bkt.tuples.Remove(&cn.original)
+	return false
 }
 
-func (cn *conn) finalize() {
-	{
-		cn.mu.RLock()
-		finalized := cn.finalized
-		cn.mu.RUnlock()
-		if finalized {
-			return
-		}
-	}
-
-	cn.mu.Lock()
-	finalized := cn.finalized
-	cn.finalized = true
-	cn.mu.Unlock()
-	if finalized {
-		return
-	}
-
-	cn.ct.finalize(cn)
+func (cn *conn) getFinalizeResult() finalizeResult {
+	return finalizeResult(atomic.LoadUint32(&cn.finalizeResult))
 }
 
-// performNAT setups up the connection for the specified NAT.
+// finalize attempts to finalize the connection and returns true iff the
+// connection was successfully finalized.
 //
-// Generally, only the first packet of a connection reaches this method; other
-// other packets will be manipulated without needing to modify the connection.
-func (cn *conn) performNAT(pkt *PacketBuffer, hook Hook, r *Route, ports portRange, address tcpip.Address, dnat bool) {
-	cn.performNATIfNoop(ports, address, dnat)
-	cn.handlePacket(pkt, hook, r)
+// If the connection failed to finalize, the caller should drop the packet
+// associated with the connection.
+//
+// If multiple goroutines attempt to finalize at the same time, only one
+// goroutine will perform the work to finalize the connection, but all
+// goroutines will block until the finalizing goroutine finishes finalizing.
+func (cn *conn) finalize() bool {
+	cn.finalizeOnce.Do(func() {
+		res := finalizeResultConflict
+		if cn.ct.finalize(cn) {
+			res = finalizeResultSuccess
+		}
+		atomic.StoreUint32(&cn.finalizeResult, uint32(res))
+	})
+
+	switch res := cn.getFinalizeResult(); res {
+	case finalizeResultSuccess:
+		return true
+	case finalizeResultConflict:
+		return false
+	default:
+		panic(fmt.Sprintf("unhandled result = %d", res))
+	}
+}
+
+func (cn *conn) maybePerformNoopNAT(dnat bool) {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+
+	var manip *manipType
+	if dnat {
+		manip = &cn.destinationManip
+	} else {
+		manip = &cn.sourceManip
+	}
+
+	if *manip == manipNotPerformed {
+		*manip = manipPerformedNoop
+	}
 }
 
 type portRange struct {
@@ -553,35 +603,48 @@ type portRange struct {
 	size  uint16
 }
 
-func (cn *conn) performNATIfNoop(ports portRange, address tcpip.Address, dnat bool) {
+// performNAT setups up the connection for the specified NAT and rewrites the
+// packet.
+//
+// If NAT has already been performed on the connection, then the packet will
+// be rewritten with the NAT performed on the connection, ignoring the passed
+// address and port range.
+//
+// Generally, only the first packet of a connection reaches this method; other
+// other packets will be manipulated without needing to modify the connection.
+func (cn *conn) performNAT(pkt *PacketBuffer, hook Hook, r *Route, ports portRange, natAddress tcpip.Address, dnat bool) {
+	// Make sure the packet is re-written after performing NAT.
+	defer func() {
+		// handlePacket returns true if the packet may skip the NAT table as the
+		// connection is already NATed, but if we reach this point we must be in the
+		// NAT table, so the return value is useless for us.
+		_ = cn.handlePacket(pkt, hook, r)
+	}()
+
 	cn.mu.Lock()
 	defer cn.mu.Unlock()
-
-	if cn.finalized {
-		return
-	}
 
 	cn.reply.mu.Lock()
 	defer cn.reply.mu.Unlock()
 
+	var manip *manipType
+	var address *tcpip.Address
 	var port *uint16
 	if dnat {
-		if cn.destinationManip {
-			return
-		}
-		cn.destinationManip = true
-
-		cn.reply.tupleID.srcAddr = address
+		manip = &cn.destinationManip
+		address = &cn.reply.tupleID.srcAddr
 		port = &cn.reply.tupleID.srcPort
 	} else {
-		if cn.sourceManip {
-			return
-		}
-		cn.sourceManip = true
-
-		cn.reply.tupleID.dstAddr = address
+		manip = &cn.sourceManip
+		address = &cn.reply.tupleID.dstAddr
 		port = &cn.reply.tupleID.dstPort
 	}
+
+	if *manip != manipNotPerformed {
+		return
+	}
+	*manip = manipPerformed
+	*address = natAddress
 
 	// Does the current port fit in the range?
 	if end := ports.start + ports.size - 1; *port >= ports.start && *port <= end {
@@ -686,37 +749,34 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 
 	reply := pkt.tuple.reply
 
-	tid, performManip := func() (tupleID, bool) {
+	tid, manip := func() (tupleID, manipType) {
 		cn.mu.RLock()
 		defer cn.mu.RUnlock()
 
-		var tuple *tuple
 		if reply {
-			if dnat {
-				if !cn.sourceManip {
-					return tupleID{}, false
-				}
-			} else if !cn.destinationManip {
-				return tupleID{}, false
-			}
+			tid := cn.original.id()
 
-			tuple = &cn.original
-		} else {
 			if dnat {
-				if !cn.destinationManip {
-					return tupleID{}, false
-				}
-			} else if !cn.sourceManip {
-				return tupleID{}, false
+				return tid, cn.sourceManip
 			}
-
-			tuple = &cn.reply
+			return tid, cn.destinationManip
 		}
 
-		return tuple.id(), true
+		tid := cn.reply.id()
+		if dnat {
+			return tid, cn.destinationManip
+		}
+		return tid, cn.sourceManip
 	}()
-	if !performManip {
+	switch manip {
+	case manipNotPerformed:
 		return false
+	case manipPerformedNoop:
+		*natDone = true
+		return true
+	case manipPerformed:
+	default:
+		panic(fmt.Sprintf("unhandled manip = %d", manip))
 	}
 
 	newPort := tid.dstPort
@@ -889,9 +949,7 @@ func (ct *ConnTrack) reapTupleLocked(reapingTuple *tuple, bktID int, bkt *bucket
 	}
 
 	otherTupleBktID := ct.bucket(otherTuple.id())
-	reapingTuple.conn.mu.RLock()
-	replyTupleInserted := reapingTuple.conn.finalized
-	reapingTuple.conn.mu.RUnlock()
+	replyTupleInserted := reapingTuple.conn.getFinalizeResult() == finalizeResultSuccess
 
 	// To maintain lock order, we can only reap both tuples if the tuple for the
 	// other direction appears later in the table.
@@ -939,7 +997,7 @@ func (ct *ConnTrack) originalDst(epID TransportEndpointID, netProto tcpip.Networ
 
 	t.conn.mu.RLock()
 	defer t.conn.mu.RUnlock()
-	if !t.conn.destinationManip {
+	if t.conn.destinationManip == manipNotPerformed {
 		// Unmanipulated destination.
 		return "", 0, &tcpip.ErrInvalidOptionValue{}
 	}
